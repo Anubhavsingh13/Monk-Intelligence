@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../.."
+		},
+		{
+			"name": "Fraudops",
+			"path": "../../../../../../Fraudops"
+		}
+	],
+	"settings": {}
+}
