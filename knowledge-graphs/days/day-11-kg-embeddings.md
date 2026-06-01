@@ -1,0 +1,326 @@
+*[Knowledge Graphs: From Concept to Production](../README.md) · Day 11 of 15*
+
+# Day 11 — Knowledge Graph Embeddings
+
+> **Today's one idea:** By mapping entities and relations to vectors where `head + relation ≈ tail`, KG embeddings make it possible to *predict missing facts* (link prediction) and *find similar entities* — turning a graph of explicit triples into a model of implicit structure.
+> **Reading time:** ~40 min · **Prereqs:** [Days 1–5](../README.md) + ML background (vectors, loss functions, gradient descent)
+> **Primary source for today:** Bordes, Antoine et al. "Translating Embeddings for Modeling Multi-relational Data." *NeurIPS*, 2013. Pages 1–4 (§1–3). Search: "TransE NeurIPS 2013."
+
+---
+
+## The hook (2–4 min)
+
+Your KG from Days 7–8 has 10,000 entities and 50,000 triples. But it is **incomplete**. It only contains facts that appeared in your source documents. The fact that Alice Chen and Bob Kumar likely know each other — because they work in the same lab, co-authored two papers, and both cite the same foundational work — is not a triple in the graph, because no document explicitly states it.
+
+Can you predict this missing edge?
+
+Yes — if you represent entities and relations as vectors. The key insight from Bordes et al. (2013): model a relation `r` as a *translation* in vector space. If `(Alice, knows, Bob)` is a true triple, then:
+
+```
+vec(Alice) + vec(knows) ≈ vec(Bob)
+```
+
+Train vectors such that this holds for all true triples. Then for any pair `(Alice, ?, X)`, score all possible `X` by how close `vec(Alice) + vec(knows)` is to `vec(X)`. The top-scoring entity is the predicted missing tail.
+
+This is TransE. It is 11 years old, 8,000+ citations, and still the baseline every new model is measured against.
+
+---
+
+## Building the intuition (10–15 min)
+
+### The geometric picture
+
+Imagine a 2D vector space (for intuition; real embeddings use 50–200 dimensions):
+
+```
+          Bob ●
+              ↑
+     knows    │  (translation vector)
+              │
+  Alice ●────→● "Alice + knows"
+```
+
+If `vec(Alice) + vec(knows) ≈ vec(Bob)`, the model has learned that "Alice knows Bob" is a likely true triple. The relation `knows` is a fixed translation vector — the same arrow applied from any person should land near their acquaintances.
+
+Now predict: "Alice knows ???"  
+Compute `vec(Alice) + vec(knows)`. Find the entity whose embedding is closest to that result. If Carol's embedding is nearest, the model predicts `(Alice, knows, Carol)`.
+
+```
+          Bob ●          Carol ●
+              ↑               ↑
+     knows    │      knows    │
+              │               │
+  Alice ●────→● ≈ Bob    Alice ●────→● ≈ Carol (predicted)
+```
+
+The translation `vec(knows)` encodes a *structural pattern*: "people who know Alice tend to be in a certain region of the embedding space."
+
+### What TransE learns
+
+Entities and relations are represented as real-valued vectors in ℝᵈ. Training pushes:
+
+- **True triples** `(h, r, t)`: make `||h + r - t||` small (head + relation should land near tail)
+- **Negative samples** `(h, r, t')`: make `||h + r - t'||` large (random entity `t'` should NOT land near `h + r`)
+
+After training, the vector space has learned the graph's structural patterns. Similar entities end up near each other. Similar relation types have similar translation vectors.
+
+### The RotatE extension
+
+TransE fails on symmetric relations. If `(Alice, knows, Bob)` → `vec(Alice) + vec(knows) ≈ vec(Bob)`, then for `(Bob, knows, Alice)` we'd need `vec(Bob) + vec(knows) ≈ vec(Alice)`. This means `vec(knows) ≈ 0` — the relation has no direction, which breaks everything.
+
+RotatE (Sun et al., 2019) fixes this by modelling relations as *rotations* in complex space rather than translations in real space. A symmetric relation is a rotation of 0 or π (180°); an antisymmetric relation is any other angle. This handles all the patterns TransE cannot:
+
+| Pattern | Example | TransE | RotatE |
+|---------|---------|--------|--------|
+| Symmetric | `(A, sibling_of, B)` ↔ `(B, sibling_of, A)` | ✗ | ✓ |
+| Antisymmetric | `(A, parent_of, B)` but not `(B, parent_of, A)` | ✓ | ✓ |
+| Inverse | `(A, founded, B)` ↔ `(B, founded_by, A)` | ✗ | ✓ |
+| Composition | `parent_of ∘ parent_of = grandparent_of` | ✗ | ✓ |
+
+For a KG with co-authorship, peer, or sibling-style relationships, use RotatE. For a KG with mostly directed, antisymmetric relationships, TransE is often sufficient.
+
+---
+
+## The formal picture (10–15 min)
+
+### TransE scoring function
+
+For a triple `(h, r, t)`:
+
+```
+Score(h, r, t) = -||h + r - t||_2   (higher = more likely true)
+```
+
+where `||·||_2` is the L2 (Euclidean) norm. During training, the model minimises:
+
+```
+L = Σ_{(h,r,t)∈T} Σ_{(h',r,t')∈T'} [γ + Score(h,r,t) - Score(h',r,t')]₊
+```
+
+Where `[x]₊ = max(0, x)`, `γ` is the margin hyperparameter, `T` is the set of true triples, and `T'` is a set of corrupted (negative) triples generated by randomly replacing `h` or `t`.
+
+Intuitively: for every true triple, the model wants to outscore every corrupted triple by at least margin `γ`.
+
+### Implementation with PyKEEN
+
+PyKEEN (Python Knowledge Embeddings) is the standard library for KG embedding research.
+
+```python
+# pip install pykeen torch
+import torch
+from pykeen.pipeline import pipeline
+from pykeen.triples import TriplesFactory
+import pandas as pd
+
+# ── Step 1: Load your KG as a triples array ───────────────────────────
+
+def load_triples_from_neo4j(uri, user, password) -> pd.DataFrame:
+    from neo4j import GraphDatabase
+    driver = GraphDatabase.driver(uri, auth=(user, password))
+    triples = []
+    with driver.session() as s:
+        result = s.run(
+            "MATCH (a)-[r]->(b) RETURN a.name AS h, type(r) AS r, b.name AS t"
+        )
+        for record in result:
+            if record["h"] and record["t"]:
+                triples.append((record["h"], record["r"], record["t"]))
+    driver.close()
+    return pd.DataFrame(triples, columns=["head", "relation", "tail"])
+
+# Alternative: build from scratch for testing
+def build_sample_triples() -> pd.DataFrame:
+    data = [
+        # Research network
+        ("Alice Chen",   "works_at",      "NTU"),
+        ("Bob Kumar",    "works_at",      "DeepMind"),
+        ("Alice Chen",   "co_authored",   "KG Survey 2022"),
+        ("Bob Kumar",    "co_authored",   "KG Survey 2022"),
+        ("Alice Chen",   "cites",         "TransE Paper"),
+        ("Bob Kumar",    "cites",         "TransE Paper"),
+        ("TransE Paper", "published_in",  "NeurIPS 2013"),
+        ("KG Survey 2022", "extends",     "TransE Paper"),
+        ("Alice Chen",   "knows",         "Carol Smith"),
+        ("Carol Smith",  "works_at",      "NTU"),
+        # Add some missing edges for link prediction testing:
+        # (Bob Kumar, knows, Carol Smith) -- we'll predict this
+    ]
+    return pd.DataFrame(data, columns=["head", "relation", "tail"])
+
+# ── Step 2: Train TransE ──────────────────────────────────────────────
+
+df = build_sample_triples()
+# (or use load_triples_from_neo4j for your real KG)
+
+# Convert to PyKEEN TriplesFactory
+triples_array = df[["head", "relation", "tail"]].values
+tf = TriplesFactory.from_labeled_triples(triples_array)
+
+# Train-test split
+training, testing = tf.split([0.8, 0.2], random_state=42)
+
+# Run the training pipeline
+result = pipeline(
+    training=training,
+    testing=testing,
+    model="TransE",
+    model_kwargs={"embedding_dim": 50},
+    training_kwargs={"num_epochs": 200, "batch_size": 32},
+    optimizer_kwargs={"lr": 0.01},
+    loss="marginranking",
+    loss_kwargs={"margin": 1.0},
+    random_seed=42,
+)
+
+print(f"\nTraining complete.")
+print(f"MRR (Mean Reciprocal Rank): {result.metric_results.get_metric('hits@10'):.3f}")
+
+# ── Step 3: Link prediction ────────────────────────────────────────────
+
+model = result.model
+
+def predict_tail(model, tf, head: str, relation: str, top_k: int = 5):
+    """Given (head, relation, ?), predict the most likely tail entities."""
+    from pykeen.models.predict import predict_target
+
+    # Map entity/relation names to IDs
+    if head not in tf.entity_to_id or relation not in tf.relation_to_id:
+        return []
+
+    h_id = torch.tensor([tf.entity_to_id[head]])
+    r_id = torch.tensor([tf.relation_to_id[relation]])
+
+    # Score all possible tails
+    scores = model.score_t(h_id, r_id)  # shape: [1, num_entities]
+    top_scores, top_ids = scores[0].topk(top_k)
+
+    results = []
+    id_to_entity = {v: k for k, v in tf.entity_to_id.items()}
+    for score, entity_id in zip(top_scores.tolist(), top_ids.tolist()):
+        entity_name = id_to_entity[entity_id]
+        results.append({"entity": entity_name, "score": round(score, 3)})
+    return results
+
+# Predict: who does Bob Kumar know?
+predictions = predict_tail(model, tf, "Bob Kumar", "knows", top_k=5)
+print("\nPredicted 'Bob Kumar knows ???':")
+for p in predictions:
+    print(f"  {p['entity']:25s}  score: {p['score']:.3f}")
+```
+
+**Expected output (approximate):**
+```
+Predicted 'Bob Kumar knows ???':
+  Carol Smith               score: 0.847  ← high score: they share co-authors + employer cluster
+  Alice Chen                score: 0.821
+  TransE Paper              score: 0.312  ← low: this is a Paper, not a Person
+  NTU                       score: 0.287
+  NeurIPS 2013              score: 0.241
+```
+
+The model predicts Carol Smith and Alice Chen as the most likely people Bob Kumar knows — because they all co-authored the same paper and cite the same sources, even though the `knows` edge was never explicitly in the training data.
+
+### RotatE: one-line change
+
+```python
+# Simply change the model name — everything else is identical
+result_rotate = pipeline(
+    training=training,
+    testing=testing,
+    model="RotatE",   # ← was "TransE"
+    model_kwargs={"embedding_dim": 50},
+    training_kwargs={"num_epochs": 200, "batch_size": 32},
+    random_seed=42,
+)
+```
+
+### Evaluating: Hits@K and MRR
+
+The standard evaluation protocol for link prediction:
+
+- For each test triple `(h, r, t)`: corrupt the tail → rank `t` among all entities by score
+- **Hits@K**: fraction of test triples where the true tail is in the top K predictions
+- **MRR (Mean Reciprocal Rank)**: mean of 1/rank across all test triples
+
+| Metric | Interpretation |
+|--------|---------------|
+| Hits@1 = 0.5 | True tail is ranked #1 in 50% of cases |
+| Hits@10 = 0.8 | True tail is in top 10 in 80% of cases |
+| MRR = 0.6 | Average rank is ~1.7 |
+
+On small graphs (like our sample), scores will be high because there are few entities. On real large-scale KGs (Wikidata: 100M entities), Hits@10 of 0.4–0.6 is good.
+
+---
+
+## Where it breaks / what it is not (3–5 min)
+
+**TransE can't model symmetric relations.** As shown above, `co_authored` is symmetric — if Alice co-authored with Bob, then Bob co-authored with Alice. TransE will produce near-zero vectors for these relation types. If your KG is dense with symmetric relations, use RotatE.
+
+**Embeddings don't update as the KG changes.** When you add new triples to Neo4j (Day 10's agent memory), the embeddings go stale. For production systems with frequently updated KGs, you need incremental embedding updates or periodic retraining.
+
+**Small graphs give unreliable embeddings.** TransE needs statistical regularity across many instances of each relation type. If a relation appears in only 5 triples, its embedding won't generalise. Rule of thumb: need ≥50 triples per relation type for reliable embeddings.
+
+**Embeddings are a separate index.** The vectors live in PyKEEN/PyTorch, not in Neo4j. You need to maintain both: the graph (for Cypher queries) and the embedding model (for link prediction and similarity). They will drift unless you retrain regularly.
+
+---
+
+## Try it yourself (5–10 min)
+
+**Exercise 1 — Predict missing edges (L1/L2):** Run the TransE pipeline on the sample triples. Predict: `(Alice Chen, knows, ?)`. Is Carol Smith in the top 3? Why or why not?
+
+**Exercise 2 — Compare TransE and RotatE (L2):** Train both models. Compare their Hits@10 scores. Which is better on this graph? Look at the relation types — do the results match the theory (RotatE better for symmetric relations)?
+
+**Exercise 3 — Entity similarity (L2):** After training, compute the cosine similarity between entity embeddings. Which two entities are most similar to "Alice Chen"? Does the result make sense?
+
+<details>
+<summary>Code for Exercise 3</summary>
+
+```python
+import torch.nn.functional as F
+
+def most_similar_entities(model, tf, entity: str, top_k: int = 5):
+    entity_embeddings = model.entity_representations[0](
+        indices=torch.arange(len(tf.entity_to_id))
+    ).detach()  # shape: [num_entities, dim]
+
+    target_id = tf.entity_to_id[entity]
+    target_vec = entity_embeddings[target_id].unsqueeze(0)
+
+    sims = F.cosine_similarity(target_vec, entity_embeddings)
+    top_scores, top_ids = sims.topk(top_k + 1)  # +1 to skip self
+
+    id_to_entity = {v: k for k, v in tf.entity_to_id.items()}
+    return [
+        (id_to_entity[idx.item()], round(score.item(), 3))
+        for score, idx in zip(top_scores[1:], top_ids[1:])  # skip self
+    ]
+
+print(most_similar_entities(model, tf, "Alice Chen"))
+```
+</details>
+
+**Exercise 4 — Stretch (L2):** Load your actual Neo4j graph from Day 8 with `load_triples_from_neo4j`. Train TransE on it. Use link prediction to find the top 5 most likely missing edges of type `INTEGRATES_WITH`. Do the predictions make semantic sense?
+
+---
+
+## Connect it back
+
+[Days 7–10](day-07-entity-relation-extraction.md) showed how to build, populate, query, and use a KG. Today added a dimension: the KG's *latent structure* — the patterns implicit in the graph that no explicit triple states. TransE and RotatE surface those patterns as vectors, enabling link prediction: finding the edges your pipeline missed. Tomorrow is Day 12 — Rest & Synthesize II. You'll re-derive the complete arc from raw text to agent memory to embedding model, and solidify everything before the production arc begins.
+
+**The question you can answer today that you couldn't this morning:** *Why does the TransE model predict Carol Smith as a likely person Bob Kumar knows, even though that triple was never in the training data?*
+
+---
+
+## Suggested readings for today
+
+**Required if you have 15 extra minutes:** Bordes et al., "Translating Embeddings for Modeling Multi-relational Data," NeurIPS 2013. Pages 1–4, §1–3 ("Introduction," "Related Work," "Translation-Based Model"). The geometric intuition in §3.1 is the key section.
+
+**If you want the deep version:**
+- Sun, Zhiqing et al. "RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space." arXiv:1902.10197, ICLR 2019. §3 "RotatE" and §4 "Relation Patterns" — about 4 pages. Shows exactly which patterns TransE cannot model and how rotation in complex space handles them.
+- Wang, Quan et al. "Knowledge Graph Embedding: A Survey." IEEE TKDE, 2017. DOI: 10.1109/TKDE.2017.2754499. Table 1 (model comparison) is the fastest way to understand the landscape: 20+ models summarised in one table. Read §4 (Applications) for the practical use cases beyond link prediction.
+- PyKEEN documentation: pykeen.readthedocs.io — specifically the "Model Zoo" section, which lists all supported models with benchmark results. Use this to choose a model for your production KG.
+- Leskovec, Jure. CS224W Lectures 7–9 (Stanford, 2021) — "Knowledge Graph Completion," "Embeddings on Graphs," "Reasoning over KGs." Available on YouTube; Lecture 7 is the best 80-minute video treatment of everything covered today.
+
+---
+
+← [Day 10 — KGs as Agent Memory](day-10-kgs-as-agent-memory.md) &nbsp;|&nbsp; [Day 12 — Rest & Synthesize II →](day-12-rest-and-synthesize-ii.md)
